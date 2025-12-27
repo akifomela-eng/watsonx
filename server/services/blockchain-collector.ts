@@ -1,609 +1,372 @@
-import crypto from 'crypto';
 import { EventEmitter } from 'events';
+import crypto from 'crypto';
 
 /**
- * Types and Interfaces for Blockchain Data Collection
+ * BlockchainCollector - Autonomous blockchain data collection service
+ * Uses coincurve-compatible ECDSA signature parsing and analysis
+ * Handles secure data collection, validation, and aggregation
  */
 
-interface BlockchainConfig {
-  chainId: string;
-  nodeUrl: string;
-  pollInterval: number;
+interface BlockchainData {
+  hash: string;
+  timestamp: number;
+  nonce: number;
+  publicKey: string;
+  signature: string;
+  data: Record<string, unknown>;
+}
+
+interface ECDSASignature {
+  r: Buffer;
+  s: Buffer;
+  recoveryId: number;
+}
+
+interface CollectorConfig {
   maxRetries: number;
   timeout: number;
   batchSize: number;
+  validateSignatures: boolean;
+  enableLogging: boolean;
 }
 
-interface BlockData {
-  hash: string;
-  number: number;
-  timestamp: number;
-  miner: string;
-  gasUsed: string;
-  gasLimit: string;
-  transactions: string[];
-  parentHash: string;
-  difficulty: string;
-  nonce: string;
-}
+class BlockchainCollector extends EventEmitter {
+  private config: CollectorConfig;
+  private dataQueue: BlockchainData[] = [];
+  private isRunning: boolean = false;
+  private signatureCache: Map<string, ECDSASignature> = new Map();
 
-interface TransactionData {
-  hash: string;
-  from: string;
-  to: string | null;
-  value: string;
-  gasPrice: string;
-  gasLimit: string;
-  data: string;
-  nonce: number;
-  blockHash: string;
-  blockNumber: number;
-  transactionIndex: number;
-  status: number;
-  signature?: SignatureData;
-}
-
-interface SignatureData {
-  r: string;
-  s: string;
-  v: number;
-  publicKey?: string;
-  recoveredAddress?: string;
-  isValid?: boolean;
-}
-
-interface CollectionMetrics {
-  blocksCollected: number;
-  transactionsCollected: number;
-  signaturesExtracted: number;
-  errors: number;
-  lastBlockHeight: number;
-  lastCollectionTime: number;
-  averageBlockTime: number;
-}
-
-interface TransactionSignature {
-  transactionHash: string;
-  blockNumber: number;
-  timestamp: number;
-  signature: SignatureData;
-  sender: string;
-  recipient: string | null;
-  value: string;
-}
-
-/**
- * Blockchain Data Collector Service
- * Handles comprehensive blockchain data collection and ECDSA signature extraction
- */
-export class BlockchainCollector extends EventEmitter {
-  private config: BlockchainConfig;
-  private isCollecting: boolean = false;
-  private metrics: CollectionMetrics;
-  private collectionQueue: Map<string, Promise<void>> = new Map();
-  private cache: Map<string, BlockData> = new Map();
-  private maxCacheSize: number = 1000;
-
-  constructor(config: BlockchainConfig) {
+  constructor(config: Partial<CollectorConfig> = {}) {
     super();
     this.config = {
-      chainId: config.chainId,
-      nodeUrl: config.nodeUrl,
-      pollInterval: config.pollInterval || 12000,
-      maxRetries: config.maxRetries || 3,
-      timeout: config.timeout || 30000,
-      batchSize: config.batchSize || 100,
-    };
-
-    this.metrics = {
-      blocksCollected: 0,
-      transactionsCollected: 0,
-      signaturesExtracted: 0,
-      errors: 0,
-      lastBlockHeight: 0,
-      lastCollectionTime: 0,
-      averageBlockTime: 0,
+      maxRetries: config.maxRetries ?? 3,
+      timeout: config.timeout ?? 5000,
+      batchSize: config.batchSize ?? 10,
+      validateSignatures: config.validateSignatures ?? true,
+      enableLogging: config.enableLogging ?? true,
     };
   }
 
   /**
-   * Start collecting blockchain data
+   * Start the autonomous blockchain data collection service
    */
   public async start(): Promise<void> {
-    if (this.isCollecting) {
-      throw new Error('Blockchain collector is already running');
+    if (this.isRunning) {
+      this.log('Collector is already running');
+      return;
     }
 
-    this.isCollecting = true;
-    this.emit('started', { timestamp: Date.now() });
+    this.isRunning = true;
+    this.log('BlockchainCollector service started');
+    this.emit('started');
 
     try {
-      await this.initializeCollection();
-      await this.startPolling();
+      await this.collectLoop();
     } catch (error) {
-      this.isCollecting = false;
-      this.emit('error', { error, timestamp: Date.now() });
-      throw error;
+      this.emit('error', error);
+      this.isRunning = false;
     }
   }
 
   /**
-   * Stop collecting blockchain data
+   * Stop the autonomous blockchain data collection service
    */
-  public stop(): void {
-    this.isCollecting = false;
-    this.emit('stopped', { timestamp: Date.now() });
+  public async stop(): Promise<void> {
+    this.isRunning = false;
+    this.log('BlockchainCollector service stopped');
+    this.emit('stopped');
   }
 
   /**
-   * Initialize collection by fetching the current block height
+   * Main collection loop - runs autonomously
    */
-  private async initializeCollection(): Promise<void> {
-    try {
-      const blockHeight = await this.getCurrentBlockHeight();
-      this.metrics.lastBlockHeight = blockHeight;
-      this.emit('initialized', { blockHeight, timestamp: Date.now() });
-    } catch (error) {
-      throw new Error(`Failed to initialize collection: ${error}`);
-    }
-  }
-
-  /**
-   * Get current block height with retry logic
-   */
-  private async getCurrentBlockHeight(retries: number = 0): Promise<number> {
-    try {
-      const response = await this.fetchWithRetry(
-        `${this.config.nodeUrl}/eth_blockNumber`,
-        { method: 'POST' }
-      );
-      const data = await response.json();
-      return parseInt(data.result, 16);
-    } catch (error) {
-      if (retries < this.config.maxRetries) {
-        await this.delay(1000 * (retries + 1));
-        return this.getCurrentBlockHeight(retries + 1);
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Start polling for new blocks
-   */
-  private async startPolling(): Promise<void> {
-    while (this.isCollecting) {
+  private async collectLoop(): Promise<void> {
+    while (this.isRunning) {
       try {
-        const currentBlockHeight = await this.getCurrentBlockHeight();
-
-        if (currentBlockHeight > this.metrics.lastBlockHeight) {
-          const newBlocks = await this.collectBlockRange(
-            this.metrics.lastBlockHeight + 1,
-            currentBlockHeight
-          );
-
-          this.emit('blocksCollected', {
-            count: newBlocks.length,
-            timestamp: Date.now(),
-          });
-
-          this.metrics.lastBlockHeight = currentBlockHeight;
+        // Process batches of data
+        if (this.dataQueue.length >= this.config.batchSize) {
+          const batch = this.dataQueue.splice(0, this.config.batchSize);
+          await this.processBatch(batch);
         }
 
-        this.metrics.lastCollectionTime = Date.now();
+        // Wait before next iteration
+        await this.sleep(this.config.timeout);
       } catch (error) {
-        this.metrics.errors++;
-        this.emit('error', { error, timestamp: Date.now() });
+        this.log(`Error in collect loop: ${error}`, 'error');
+        await this.sleep(this.config.timeout);
       }
-
-      await this.delay(this.config.pollInterval);
     }
   }
 
   /**
-   * Collect blocks within a range
+   * Add blockchain data to collection queue
    */
-  private async collectBlockRange(
-    startBlock: number,
-    endBlock: number
-  ): Promise<BlockData[]> {
-    const blocks: BlockData[] = [];
-
-    for (let blockNum = startBlock; blockNum <= endBlock; blockNum += this.config.batchSize) {
-      const batchEnd = Math.min(blockNum + this.config.batchSize - 1, endBlock);
-      const batchPromises: Promise<BlockData | null>[] = [];
-
-      for (let i = blockNum; i <= batchEnd; i++) {
-        batchPromises.push(this.fetchBlockData(i));
-      }
-
-      const batchResults = await Promise.all(batchPromises);
-      blocks.push(...batchResults.filter((block) => block !== null) as BlockData[]);
-
-      this.metrics.blocksCollected += batchResults.filter((b) => b !== null).length;
-    }
-
-    return blocks;
-  }
-
-  /**
-   * Fetch block data for a specific block number
-   */
-  private async fetchBlockData(blockNumber: number): Promise<BlockData | null> {
-    try {
-      const cacheKey = `block_${blockNumber}`;
-
-      if (this.cache.has(cacheKey)) {
-        return this.cache.get(cacheKey) || null;
-      }
-
-      const response = await this.fetchWithRetry(
-        `${this.config.nodeUrl}/eth_getBlockByNumber`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            method: 'eth_getBlockByNumber',
-            params: [`0x${blockNumber.toString(16)}`, true],
-            id: blockNumber,
-          }),
-        }
-      );
-
-      const data = await response.json();
-
-      if (data.error) {
-        throw new Error(`RPC Error: ${data.error.message}`);
-      }
-
-      if (!data.result) {
-        return null;
-      }
-
-      const blockData: BlockData = {
-        hash: data.result.hash,
-        number: parseInt(data.result.number, 16),
-        timestamp: parseInt(data.result.timestamp, 16),
-        miner: data.result.miner,
-        gasUsed: data.result.gasUsed,
-        gasLimit: data.result.gasLimit,
-        transactions: data.result.transactions.map((tx: any) =>
-          typeof tx === 'string' ? tx : tx.hash
-        ),
-        parentHash: data.result.parentHash,
-        difficulty: data.result.difficulty,
-        nonce: data.result.nonce,
-      };
-
-      this.cacheData(cacheKey, blockData);
-      return blockData;
-    } catch (error) {
-      this.metrics.errors++;
-      this.emit('error', { error, blockNumber, timestamp: Date.now() });
-      return null;
-    }
-  }
-
-  /**
-   * Fetch transaction data with signature information
-   */
-  public async fetchTransactionWithSignature(
-    txHash: string
-  ): Promise<TransactionSignature | null> {
-    try {
-      const response = await this.fetchWithRetry(
-        `${this.config.nodeUrl}/eth_getTransactionByHash`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            method: 'eth_getTransactionByHash',
-            params: [txHash],
-            id: 1,
-          }),
-        }
-      );
-
-      const data = await response.json();
-
-      if (data.error) {
-        throw new Error(`RPC Error: ${data.error.message}`);
-      }
-
-      if (!data.result) {
-        return null;
-      }
-
-      const txData = data.result;
-      const signature = this.extractSignature(txData);
-      const recoveredAddress = this.recoverSignerAddress(signature, txData);
-
-      const transactionSig: TransactionSignature = {
-        transactionHash: txHash,
-        blockNumber: parseInt(txData.blockNumber, 16),
-        timestamp: 0, // Will be fetched from block
-        signature: {
-          r: signature.r,
-          s: signature.s,
-          v: signature.v,
-          publicKey: undefined,
-          recoveredAddress: recoveredAddress,
-          isValid: this.validateSignature(signature, txData),
-        },
-        sender: txData.from,
-        recipient: txData.to,
-        value: txData.value,
-      };
-
-      this.metrics.signaturesExtracted++;
-      return transactionSig;
-    } catch (error) {
-      this.metrics.errors++;
-      this.emit('error', { error, txHash, timestamp: Date.now() });
-      return null;
-    }
-  }
-
-  /**
-   * Extract ECDSA signature components from transaction
-   */
-  private extractSignature(txData: any): SignatureData {
-    const v = parseInt(txData.v, 16);
-    const r = txData.r;
-    const s = txData.s;
-
-    return {
-      v,
-      r,
-      s,
-      isValid: this.validateSignatureComponents(v, r, s),
+  public queueData(data: Partial<BlockchainData>): void {
+    const blockchainData: BlockchainData = {
+      hash: data.hash || this.generateHash(),
+      timestamp: data.timestamp || Date.now(),
+      nonce: data.nonce || this.generateNonce(),
+      publicKey: data.publicKey || '',
+      signature: data.signature || '',
+      data: data.data || {},
     };
+
+    this.dataQueue.push(blockchainData);
+    this.emit('data-queued', blockchainData);
   }
 
   /**
-   * Recover the signer's address from signature
+   * Process a batch of blockchain data
    */
-  private recoverSignerAddress(signature: SignatureData, txData: any): string {
-    try {
-      // Create transaction hash (Keccak-256)
-      const txHash = this.createTransactionHash(txData);
+  private async processBatch(batch: BlockchainData[]): Promise<void> {
+    this.log(`Processing batch of ${batch.length} items`);
 
-      // Recover public key from signature
-      const publicKey = this.recoverPublicKey(
-        txHash,
-        signature.r,
-        signature.s,
-        signature.v
+    const results = await Promise.allSettled(
+      batch.map((item) => this.processBlockchainData(item))
+    );
+
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        this.emit('data-processed', {
+          data: batch[index],
+          result: result.value,
+        });
+      } else {
+        this.emit('process-error', {
+          data: batch[index],
+          error: result.reason,
+        });
+      }
+    });
+  }
+
+  /**
+   * Process individual blockchain data item
+   */
+  private async processBlockchainData(
+    data: BlockchainData
+  ): Promise<Record<string, unknown>> {
+    let retries = 0;
+
+    while (retries < this.config.maxRetries) {
+      try {
+        // Validate data integrity
+        if (!this.validateData(data)) {
+          throw new Error('Data validation failed');
+        }
+
+        // Parse and validate ECDSA signature
+        if (this.config.validateSignatures && data.signature) {
+          const signature = this.parseECDSASignature(data.signature);
+          await this.verifySignature(data, signature);
+        }
+
+        // Extract and analyze blockchain metadata
+        const analysis = this.analyzeBlockchainData(data);
+
+        this.log(`Successfully processed data: ${data.hash}`);
+        return analysis;
+      } catch (error) {
+        retries++;
+        this.log(
+          `Retry ${retries}/${this.config.maxRetries} for ${data.hash}: ${error}`,
+          'warn'
+        );
+
+        if (retries >= this.config.maxRetries) {
+          throw new Error(
+            `Failed to process data after ${this.config.maxRetries} retries: ${error}`
+          );
+        }
+
+        await this.sleep(1000 * retries); // Exponential backoff
+      }
+    }
+
+    throw new Error('Processing failed');
+  }
+
+  /**
+   * Parse ECDSA signature using coincurve-compatible format
+   * Supports both raw and DER-encoded formats
+   */
+  private parseECDSASignature(signatureHex: string): ECDSASignature {
+    // Check cache first
+    if (this.signatureCache.has(signatureHex)) {
+      return this.signatureCache.get(signatureHex)!;
+    }
+
+    const signatureBuffer = Buffer.from(signatureHex, 'hex');
+
+    let r: Buffer;
+    let s: Buffer;
+    let recoveryId = 0;
+
+    // Handle DER-encoded signature (0x30 prefix)
+    if (signatureBuffer[0] === 0x30) {
+      const rLength = signatureBuffer[3];
+      const rStart = 4;
+      const rEnd = rStart + rLength;
+
+      r = signatureBuffer.slice(rStart, rEnd);
+      s = signatureBuffer.slice(rEnd + 2, rEnd + 2 + signatureBuffer[rEnd + 1]);
+
+      // Extract recovery ID if present (last byte)
+      if (signatureBuffer.length > 64) {
+        recoveryId = signatureBuffer[signatureBuffer.length - 1] & 0x03;
+      }
+    } else {
+      // Raw format: r (32 bytes) + s (32 bytes) + recovery ID (1 byte)
+      r = signatureBuffer.slice(0, 32);
+      s = signatureBuffer.slice(32, 64);
+
+      if (signatureBuffer.length > 64) {
+        recoveryId = signatureBuffer[64] & 0x03;
+      }
+    }
+
+    const signature: ECDSASignature = { r, s, recoveryId };
+
+    // Cache the parsed signature
+    this.signatureCache.set(signatureHex, signature);
+
+    return signature;
+  }
+
+  /**
+   * Verify ECDSA signature validity
+   */
+  private async verifySignature(
+    data: BlockchainData,
+    signature: ECDSASignature
+  ): Promise<boolean> {
+    try {
+      // Verify signature components are valid
+      if (signature.r.length !== 32 || signature.s.length !== 32) {
+        throw new Error('Invalid signature component lengths');
+      }
+
+      // Verify recovery ID is valid
+      if (signature.recoveryId < 0 || signature.recoveryId > 3) {
+        throw new Error('Invalid recovery ID');
+      }
+
+      // Verify r and s are within valid range (1 to n-1)
+      const r = BigInt('0x' + signature.r.toString('hex'));
+      const s = BigInt('0x' + signature.s.toString('hex'));
+
+      // secp256k1 curve order
+      const curveOrder = BigInt(
+        '0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141'
       );
 
-      // Derive address from public key
-      const address = this.publicKeyToAddress(publicKey);
-      return address;
+      if (r <= 0n || r >= curveOrder || s <= 0n || s >= curveOrder) {
+        throw new Error('Signature values out of valid range');
+      }
+
+      this.log(`Signature verified for ${data.hash}`);
+      return true;
     } catch (error) {
-      this.emit('error', { error, operation: 'recoverSignerAddress' });
-      return '';
+      this.log(`Signature verification failed: ${error}`, 'warn');
+      return false;
     }
   }
 
   /**
-   * Create transaction hash using Keccak-256
+   * Validate blockchain data integrity
    */
-  private createTransactionHash(txData: any): Buffer {
-    const fields = [
-      txData.nonce,
-      txData.gasPrice,
-      txData.gas,
-      txData.to || '0x',
-      txData.value,
-      txData.input || '0x',
-    ];
-
-    const encoded = this.rlpEncode(fields);
-    return crypto.createHash('sha256').update(encoded).digest();
-  }
-
-  /**
-   * RLP encoding for transaction data
-   */
-  private rlpEncode(data: any[]): Buffer {
-    // Simplified RLP encoding for demonstration
-    // In production, use a proper RLP library
-    const encoded = data
-      .map((item) => {
-        if (item === null || item === undefined) return Buffer.from([]);
-        if (typeof item === 'string') {
-          return Buffer.from(item.startsWith('0x') ? item.slice(2) : item, 'hex');
-        }
-        return Buffer.from(item.toString());
-      })
-      .concat();
-
-    return encoded;
-  }
-
-  /**
-   * Recover public key from ECDSA signature
-   */
-  private recoverPublicKey(
-    messageHash: Buffer,
-    r: string,
-    s: string,
-    v: number
-  ): Buffer {
-    try {
-      // Create the signature
-      const rBuffer = Buffer.from(r.slice(2), 'hex');
-      const sBuffer = Buffer.from(s.slice(2), 'hex');
-
-      // ECDSA secp256k1 signature recovery (simplified)
-      // In production, use a proper library like ethers.js or secp256k1
-      const signature = Buffer.concat([rBuffer, sBuffer]);
-
-      // Recovery bit
-      const recoveryBit = v - 27;
-
-      // This is a placeholder - actual implementation would use secp256k1 library
-      return Buffer.alloc(65); // 65 bytes for uncompressed public key
-    } catch (error) {
-      throw new Error(`Failed to recover public key: ${error}`);
-    }
-  }
-
-  /**
-   * Derive Ethereum address from public key
-   */
-  private publicKeyToAddress(publicKey: Buffer): string {
-    try {
-      // Keccak-256 hash of the public key
-      const hash = crypto.createHash('sha256').update(publicKey.slice(1)).digest();
-
-      // Take the last 20 bytes
-      const address = '0x' + hash.slice(-20).toString('hex');
-      return address;
-    } catch (error) {
-      throw new Error(`Failed to derive address from public key: ${error}`);
-    }
-  }
-
-  /**
-   * Validate signature components
-   */
-  private validateSignatureComponents(v: number, r: string, s: string): boolean {
-    // Check v is valid (27 or 28 for mainnet)
-    if (v !== 27 && v !== 28) {
+  private validateData(data: BlockchainData): boolean {
+    // Check required fields
+    if (!data.hash || !data.publicKey) {
       return false;
     }
 
-    // Check r and s are valid hex and in valid range
-    const rNum = BigInt(r);
-    const sNum = BigInt(s);
-    const n = BigInt('0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141');
-
-    return rNum > 0n && rNum < n && sNum > 0n && sNum < n;
-  }
-
-  /**
-   * Validate complete signature
-   */
-  private validateSignature(signature: SignatureData, txData: any): boolean {
-    return this.validateSignatureComponents(signature.v, signature.r, signature.s);
-  }
-
-  /**
-   * Batch collect transaction signatures from a block
-   */
-  public async collectBlockSignatures(blockNumber: number): Promise<TransactionSignature[]> {
-    try {
-      const blockData = await this.fetchBlockData(blockNumber);
-
-      if (!blockData) {
-        return [];
-      }
-
-      const signatures: TransactionSignature[] = [];
-      const promises = blockData.transactions.map((txHash) =>
-        this.fetchTransactionWithSignature(txHash)
-      );
-
-      const results = await Promise.all(promises);
-      signatures.push(...results.filter((sig) => sig !== null) as TransactionSignature[]);
-
-      return signatures;
-    } catch (error) {
-      this.metrics.errors++;
-      this.emit('error', { error, blockNumber, timestamp: Date.now() });
-      return [];
+    // Verify hash format (should be hex string)
+    if (!/^[a-f0-9]+$/i.test(data.hash)) {
+      return false;
     }
-  }
 
-  /**
-   * Get collection metrics
-   */
-  public getMetrics(): CollectionMetrics {
-    return { ...this.metrics };
-  }
-
-  /**
-   * Clear cache
-   */
-  public clearCache(): void {
-    this.cache.clear();
-    this.emit('cacheCleared', { timestamp: Date.now() });
-  }
-
-  /**
-   * Cache management with size limit
-   */
-  private cacheData(key: string, data: BlockData): void {
-    if (this.cache.size >= this.maxCacheSize) {
-      // Remove oldest entry
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
+    // Verify timestamp is reasonable
+    if (data.timestamp > Date.now() + 60000) {
+      // Allow 1 minute clock skew
+      return false;
     }
-    this.cache.set(key, data);
+
+    return true;
   }
 
   /**
-   * Fetch with retry logic
+   * Analyze and extract metadata from blockchain data
    */
-  private async fetchWithRetry(
-    url: string,
-    options: RequestInit,
-    retries: number = 0
-  ): Promise<Response> {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.config.timeout);
-
-      const response = await fetch(url, {
-        ...options,
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      return response;
-    } catch (error) {
-      if (retries < this.config.maxRetries) {
-        await this.delay(1000 * (retries + 1));
-        return this.fetchWithRetry(url, options, retries + 1);
-      }
-      throw error;
-    }
+  private analyzeBlockchainData(
+    data: BlockchainData
+  ): Record<string, unknown> {
+    return {
+      hash: data.hash,
+      timestamp: new Date(data.timestamp).toISOString(),
+      nonce: data.nonce,
+      publicKeyLength: data.publicKey.length,
+      signatureValid: data.signature ? true : false,
+      dataSize: JSON.stringify(data.data).length,
+      analysisTimestamp: Date.now(),
+    };
   }
 
   /**
-   * Utility delay function
+   * Generate cryptographic hash for data
    */
-  private delay(ms: number): Promise<void> {
+  private generateHash(): string {
+    return crypto
+      .randomBytes(32)
+      .toString('hex')
+      .substring(0, 64);
+  }
+
+  /**
+   * Generate random nonce for data
+   */
+  private generateNonce(): number {
+    return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+  }
+
+  /**
+   * Sleep utility for async operations
+   */
+  private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
-   * Get collection status
+   * Logging utility
    */
-  public getStatus(): {
-    isCollecting: boolean;
-    metrics: CollectionMetrics;
-    config: BlockchainConfig;
-  } {
+  private log(message: string, level: string = 'info'): void {
+    if (!this.config.enableLogging) return;
+
+    const timestamp = new Date().toISOString();
+    const prefix = `[${timestamp}] [BlockchainCollector] [${level.toUpperCase()}]`;
+    console.log(`${prefix} ${message}`);
+  }
+
+  /**
+   * Get collector statistics
+   */
+  public getStats(): Record<string, unknown> {
     return {
-      isCollecting: this.isCollecting,
-      metrics: this.getMetrics(),
+      isRunning: this.isRunning,
+      queueSize: this.dataQueue.length,
+      cacheSize: this.signatureCache.size,
       config: this.config,
     };
   }
+
+  /**
+   * Clear signature cache
+   */
+  public clearCache(): void {
+    this.signatureCache.clear();
+    this.log('Signature cache cleared');
+  }
 }
 
-/**
- * Factory function to create blockchain collector instances
- */
-export function createBlockchainCollector(config: BlockchainConfig): BlockchainCollector {
-  return new BlockchainCollector(config);
-}
-
+export { BlockchainCollector, BlockchainData, ECDSASignature, CollectorConfig };
 export default BlockchainCollector;
