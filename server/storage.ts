@@ -1,10 +1,11 @@
 import { db } from "./db";
 import {
-  scans, scanResults, decisions, schedules,
+  scans, scanResults, decisions, schedules, vulnerableAddresses,
   type Scan, type InsertScan,
   type ScanResult, type InsertScanResult,
   type Decision, type InsertDecision,
-  type Schedule, type InsertSchedule
+  type Schedule, type InsertSchedule,
+  type VulnerableAddress, type InsertVulnerableAddress
 } from "@shared/schema";
 import { eq, desc } from "drizzle-orm";
 
@@ -31,6 +32,11 @@ export interface IStorage {
   
   // Dashboard
   getStats(): Promise<{ totalScans: number, criticalVulnerabilities: number, activeSchedules: number }>;
+
+  // Vulnerable Addresses
+  getVulnerableAddresses(): Promise<VulnerableAddress[]>;
+  storeVulnerability(vuln: InsertVulnerableAddress): Promise<VulnerableAddress>;
+  getVulnerability(addr: string): Promise<VulnerableAddress | undefined>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -107,6 +113,20 @@ export class DatabaseStorage implements IStorage {
       criticalVulnerabilities: criticalDecisions.length,
       activeSchedules: activeSchedules.length
     };
+  }
+
+  async getVulnerableAddresses(): Promise<VulnerableAddress[]> {
+    return await db.select().from(vulnerableAddresses).orderBy(desc(vulnerableAddresses.discovered));
+  }
+
+  async storeVulnerability(vuln: InsertVulnerableAddress): Promise<VulnerableAddress> {
+    const [stored] = await db.insert(vulnerableAddresses).values(vuln).returning();
+    return stored;
+  }
+
+  async getVulnerability(addr: string): Promise<VulnerableAddress | undefined> {
+    const [vuln] = await db.select().from(vulnerableAddresses).where(eq(vulnerableAddresses.address, addr));
+    return vuln;
   }
 }
 

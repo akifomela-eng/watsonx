@@ -44,6 +44,17 @@ export const schedules = pgTable("schedules", {
   createdAt: timestamp("created_at").defaultNow(),
 });
 
+// === VULNERABLE ADDRESSES ===
+export const vulnerableAddresses = pgTable("vulnerable_addresses", {
+  id: serial("id").primaryKey(),
+  address: text("address").notNull().unique(),
+  type: text("type").notNull(), // nonce_reuse, polynomial_attack, weak_nonce
+  discovered: timestamp("discovered").defaultNow(),
+  metadata: jsonb("metadata"), // Additional vulnerability data
+  severity: integer("severity"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
 // === SCHEMAS ===
 export const insertScanSchema = createInsertSchema(scans).omit({ id: true, createdAt: true, completedAt: true });
 export const insertScheduleSchema = createInsertSchema(schedules).omit({ id: true, createdAt: true, lastRun: true });
@@ -59,3 +70,7 @@ export type InsertSchedule = z.infer<typeof insertScheduleSchema>;
 
 export type Decision = typeof decisions.$inferSelect;
 export type ScanResult = typeof scanResults.$inferSelect;
+
+export type VulnerableAddress = typeof vulnerableAddresses.$inferSelect;
+export const insertVulnerableAddressSchema = createInsertSchema(vulnerableAddresses).omit({ id: true, discovered: true, createdAt: true });
+export type InsertVulnerableAddress = z.infer<typeof insertVulnerableAddressSchema>;

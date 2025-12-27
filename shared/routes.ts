@@ -81,6 +81,15 @@ export const api = {
         }),
       },
     },
+  },
+  vulnerabilities: {
+    list: {
+      method: 'GET' as const,
+      path: '/api/vulnerabilities',
+      responses: {
+        200: z.array(z.custom<{ address: string, type: string, severity: number | null, discovered: string }>()),
+      },
+    },
   }
 };
 
