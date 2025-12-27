@@ -1,68 +1,76 @@
-/**
- * Autonomous Blockchain Data Collector
- * Handles Bitcoin address discovery, transaction fetching, and signature extraction
- * Integrates with watsonx.ai for AI-powered prioritization
- * 
- * WARNING: Educational/Research Only
- * Recovering private keys without authorization is illegal and unethical
- */
-
-import { EventEmitter } from 'events';
 import axios from 'axios';
-import { decode as decodeDER } from 'asn1.js';
+import { EventEmitter } from 'events';
+import crypto from 'crypto';
+
+/**
+ * EDUCATIONAL/RESEARCH ONLY
+ * Blockchain Address and Transaction Data Collection
+ * This module is for security research and vulnerability analysis purposes only.
+ * Unauthorized private key recovery is illegal and unethical.
+ */
 
 export interface BlockchainAddress {
   address: string;
+  balance: number;
+  totalReceived: number;
+  totalSent: number;
   txCount: number;
-  totalReceived: string;
-  balance: string;
-  firstSeen: string;
-  lastActivity: string;
-  transactionHashes?: string[];
+  firstSeen: Date;
+  lastActivity: Date;
+  pubKey?: string;
+  transactions: Transaction[];
 }
 
 export interface Transaction {
-  txHash: string;
+  txid: string;
+  blockHeight: number;
+  timestamp: Date;
   inputs: TransactionInput[];
   outputs: TransactionOutput[];
-  timestamp: number;
+  rawHex: string;
 }
 
 export interface TransactionInput {
-  previousOutput: string;
+  txid: string;
+  vout: number;
   scriptSig: string;
-  signature?: string;
-  publicKey?: string;
+  scriptPubKey?: string;
+  address?: string;
+  value?: number;
 }
 
 export interface TransactionOutput {
-  value: string;
+  value: number;
   scriptPubKey: string;
   address?: string;
 }
 
+/**
+ * DER-Encoded ECDSA Signature with recovery metadata
+ * Format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S]
+ */
 export interface ECDSASignature {
-  r: string;
-  s: string;
+  r: bigint;
+  s: bigint;
   recoveryId?: number;
-  nonce?: string;
-  timestamp: number;
-  txHash: string;
-  address: string;
+  derEncoded: Buffer;
+  rawHex: string;
+  nonce?: bigint;
+  messageHash: Buffer;
+  timestamp: Date;
+  txid: string;
 }
 
 /**
- * BlockchainCollector - Autonomous data collection from blockchain
- * Uses multiple APIs for redundancy and accuracy
+ * Autonomous Blockchain Data Collector
+ * Discovers and collects Bitcoin transaction data for ECDSA vulnerability analysis
  */
 export class BlockchainCollector extends EventEmitter {
-  private blockchainInfoApi = 'https://blockchain.info';
-  private blockchairApi = 'https://api.blockchair.com/bitcoin';
-  private mempool = 'https://mempool.space/api';
-  private addressCache: Map<string, BlockchainAddress> = new Map();
-  private signatureCache: Map<string, ECDSASignature[]> = new Map();
-  private requestDelay = 1000; // ms between requests to respect rate limits
-  private lastRequestTime = 0;
+  private blockchainApiUrl = 'https://blockchain.info/api';
+  private blockchainCoreUrl = 'https://blockchair.com/bitcoin/api';
+  private cache: Map<string, BlockchainAddress> = new Map();
+  private collectedSignatures: ECDSASignature[] = [];
+  private rateLimitDelay = 1000; // 1 second between API calls
 
   constructor() {
     super();
@@ -70,316 +78,294 @@ export class BlockchainCollector extends EventEmitter {
 
   /**
    * Discover new Bitcoin addresses from recent blockchain activity
-   * Scans multiple sources for comprehensive coverage
+   * @param limit - Maximum number of blocks to scan
+   * @returns Array of discovered addresses
    */
-  public async discoverNewAddresses(): Promise<BlockchainAddress[]> {
+  public async discoverNewAddresses(limit: number = 10): Promise<BlockchainAddress[]> {
     try {
+      console.log(`[*] Discovering new addresses from last ${limit} blocks...`);
+
       const addresses: BlockchainAddress[] = [];
+      const blockHeights = await this.getRecentBlockHeights(limit);
 
-      // Method 1: Recent transactions from blockchain.info
-      const recentTxs = await this.fetchRecentTransactions();
-      for (const tx of recentTxs) {
-        for (const output of tx.outputs) {
-          if (output.address && !this.addressCache.has(output.address)) {
-            const addressData = await this.fetchAddressData(output.address);
-            if (addressData) {
-              addresses.push(addressData);
-              this.addressCache.set(output.address, addressData);
-              this.emit('address-discovered', addressData);
-            }
-          }
+      for (const height of blockHeights) {
+        await this.sleep(this.rateLimitDelay);
+
+        try {
+          const blockAddresses = await this.extractAddressesFromBlock(height);
+          addresses.push(...blockAddresses);
+
+          this.emit('addresses-discovered', { count: blockAddresses.length, blockHeight: height });
+        } catch (error) {
+          console.error(`[!] Error extracting addresses from block ${height}:`, error);
         }
       }
 
-      // Method 2: High-value addresses from Blockchair
-      const highValueAddresses = await this.discoverHighValueAddresses();
-      for (const addr of highValueAddresses) {
-        if (!this.addressCache.has(addr.address)) {
-          addresses.push(addr);
-          this.addressCache.set(addr.address, addr);
-          this.emit('address-discovered', addr);
-        }
-      }
-
-      this.emit('discovery-complete', { count: addresses.length });
+      console.log(`[+] Discovered ${addresses.length} addresses`);
       return addresses;
     } catch (error) {
-      this.emit('error', new Error(`Address discovery failed: ${error instanceof Error ? error.message : 'Unknown error'}`));
-      return [];
+      console.error('[!] Error discovering new addresses:', error);
+      throw error;
     }
   }
 
   /**
-   * Fetch recent transactions from blockchain
-   * @private
+   * Fetch detailed blockchain data for a specific address
+   * @param address - Bitcoin address to analyze
+   * @returns Complete address data including transaction history
    */
-  private async fetchRecentTransactions(): Promise<Transaction[]> {
-    await this.respectRateLimit();
+  public async fetchAddressData(address: string): Promise<BlockchainAddress> {
+    // Check cache first
+    if (this.cache.has(address)) {
+      return this.cache.get(address)!;
+    }
 
     try {
-      const response = await axios.get(`${this.blockchainInfoApi}/blocks?format=json`);
-      const transactions: Transaction[] = [];
+      console.log(`[*] Fetching data for address: ${address}`);
 
-      // Extract transactions from last 10 blocks
-      for (const block of response.data.blocks.slice(0, 10)) {
-        for (const tx of block.tx) {
-          transactions.push(this.parseTransaction(tx));
-        }
+      const response = await axios.get(
+        `${this.blockchainApiUrl}/address/${address}?format=json&limit=500`,
+        { timeout: 10000 }
+      );
+
+      const addressData: BlockchainAddress = {
+        address,
+        balance: response.data.final_balance / 1e8,
+        totalReceived: response.data.total_received / 1e8,
+        totalSent: response.data.total_sent / 1e8,
+        txCount: response.data.n_tx,
+        firstSeen: new Date(response.data.first_tx?.time * 1000 || Date.now()),
+        lastActivity: new Date(response.data.latest_tx?.time * 1000 || Date.now()),
+        transactions: [],
+      };
+
+      // Fetch all transactions for this address
+      if (response.data.txs && response.data.txs.length > 0) {
+        addressData.transactions = await this.parseTransactions(response.data.txs, address);
       }
 
-      return transactions;
+      // Cache the result
+      this.cache.set(address, addressData);
+      this.emit('address-data-fetched', addressData);
+
+      return addressData;
     } catch (error) {
-      console.error('Failed to fetch recent transactions:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Fetch detailed data about a specific Bitcoin address
-   * @param address - Bitcoin address to query
-   */
-  public async fetchAddressData(address: string): Promise<BlockchainAddress | null> {
-    await this.respectRateLimit();
-
-    try {
-      const response = await axios.get(`${this.blockchainInfoApi}/address/${address}?format=json`);
-
-      return {
-        address: response.data.address,
-        txCount: response.data.n_tx,
-        totalReceived: response.data.total_received.toString(),
-        balance: response.data.final_balance.toString(),
-        firstSeen: new Date(response.data.txs[response.data.txs.length - 1].time * 1000).toISOString(),
-        lastActivity: new Date(response.data.txs[0].time * 1000).toISOString(),
-        transactionHashes: response.data.txs.map((tx: any) => tx.hash),
-      };
-    } catch (error) {
-      console.error(`Failed to fetch address data for ${address}:`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Discover high-value addresses using Blockchair API
-   * @private
-   */
-  private async discoverHighValueAddresses(): Promise<BlockchainAddress[]> {
-    await this.respectRateLimit();
-
-    try {
-      const response = await axios.get(`${this.blockchairApi}/addresses?limit=100&sort=-balance`);
-      return response.data.data.map((addr: any) => ({
-        address: addr.address,
-        txCount: addr.transaction_count,
-        totalReceived: addr.received.toString(),
-        balance: addr.balance.toString(),
-        firstSeen: addr.first_seen_receiving,
-        lastActivity: addr.last_seen_receiving,
-      }));
-    } catch (error) {
-      console.error('Failed to discover high-value addresses:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Fetch all transactions for a given address
-   * @param address - Bitcoin address
-   */
-  public async fetchAddressTransactions(address: string): Promise<Transaction[]> {
-    await this.respectRateLimit();
-
-    try {
-      const response = await axios.get(`${this.blockchainInfoApi}/address/${address}?format=json`);
-      return response.data.txs.map((tx: any) => this.parseTransaction(tx));
-    } catch (error) {
-      console.error(`Failed to fetch transactions for ${address}:`, error);
-      return [];
+      console.error(`[!] Error fetching address data for ${address}:`, error);
+      throw error;
     }
   }
 
   /**
    * Extract ECDSA signatures from transactions
-   * Handles DER-encoded signatures, r/s values, and recovery IDs
-   * @param address - Bitcoin address
+   * Handles DER-encoded signatures with robust parsing
+   * @param transactions - Array of transactions to parse
+   * @returns Array of extracted ECDSA signatures
    */
-  public async extractSignatures(address: string): Promise<ECDSASignature[]> {
-    if (this.signatureCache.has(address)) {
-      return this.signatureCache.get(address) || [];
+  public async extractSignatures(transactions: Transaction[]): Promise<ECDSASignature[]> {
+    const signatures: ECDSASignature[] = [];
+
+    console.log(`[*] Extracting signatures from ${transactions.length} transactions...`);
+
+    for (const tx of transactions) {
+      try {
+        for (const input of tx.inputs) {
+          const scriptSig = input.scriptSig;
+
+          if (!scriptSig || scriptSig.length < 144) {
+            continue; // Skip if scriptSig is too short to contain a signature
+          }
+
+          // Extract DER-encoded signature and public key from scriptSig
+          const extracted = this.parseDERSignature(scriptSig, tx.txid, tx.timestamp);
+
+          if (extracted) {
+            signatures.push(...extracted);
+          }
+        }
+      } catch (error) {
+        console.error(`[!] Error extracting signatures from tx ${tx.txid}:`, error);
+      }
     }
 
-    try {
-      const transactions = await this.fetchAddressTransactions(address);
-      const signatures: ECDSASignature[] = [];
+    this.collectedSignatures.push(...signatures);
+    console.log(`[+] Extracted ${signatures.length} signatures`);
 
-      for (const tx of transactions) {
-        for (const input of tx.inputs) {
-          if (input.signature) {
-            const parsedSig = this.parseSignature(input.signature);
-            if (parsedSig) {
-              signatures.push({
-                ...parsedSig,
-                timestamp: tx.timestamp,
-                txHash: tx.txHash,
-                address,
+    this.emit('signatures-extracted', signatures);
+    return signatures;
+  }
+
+  /**
+   * Parse DER-encoded ECDSA signatures
+   * DER Format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S]
+   * @private
+   */
+  private parseDERSignature(
+    scriptSigHex: string,
+    txid: string,
+    timestamp: Date
+  ): ECDSASignature[] | null {
+    try {
+      const signatures: ECDSASignature[] = [];
+      const buffer = Buffer.from(scriptSigHex, 'hex');
+
+      let offset = 0;
+
+      while (offset < buffer.length) {
+        // Look for DER signature markers
+        if (buffer[offset] !== 0x30) {
+          offset++;
+          continue;
+        }
+
+        const totalLength = buffer[offset + 1];
+        if (offset + totalLength + 2 > buffer.length) {
+          break;
+        }
+
+        // Extract R
+        if (buffer[offset + 2] !== 0x02) {
+          offset++;
+          continue;
+        }
+
+        const rLength = buffer[offset + 3];
+        const rStart = offset + 4;
+        const rBuffer = buffer.slice(rStart, rStart + rLength);
+        const r = BigInt('0x' + rBuffer.toString('hex'));
+
+        // Extract S
+        const sOffset = rStart + rLength;
+        if (sOffset + 2 >= buffer.length || buffer[sOffset] !== 0x02) {
+          offset++;
+          continue;
+        }
+
+        const sLength = buffer[sOffset + 1];
+        const sStart = sOffset + 2;
+        const sBuffer = buffer.slice(sStart, sStart + sLength);
+        const s = BigInt('0x' + sBuffer.toString('hex'));
+
+        // Create signature object
+        const derBuffer = buffer.slice(offset, offset + totalLength + 2);
+
+        signatures.push({
+          r,
+          s,
+          recoveryId: undefined,
+          derEncoded: derBuffer,
+          rawHex: derBuffer.toString('hex'),
+          messageHash: crypto.createHash('sha256').digest(),
+          timestamp,
+          txid,
+        });
+
+        offset += totalLength + 2;
+      }
+
+      return signatures.length > 0 ? signatures : null;
+    } catch (error) {
+      console.error('[!] Error parsing DER signature:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get recent block heights for scanning
+   * @private
+   */
+  private async getRecentBlockHeights(limit: number): Promise<number[]> {
+    try {
+      const response = await axios.get(`${this.blockchainApiUrl}/blocks?format=json`);
+      return response.data.blocks.slice(0, limit).map((block: any) => block.height);
+    } catch (error) {
+      console.error('[!] Error fetching recent blocks:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Extract addresses from a specific block
+   * @private
+   */
+  private async extractAddressesFromBlock(blockHeight: number): Promise<BlockchainAddress[]> {
+    try {
+      const response = await axios.get(`${this.blockchainApiUrl}/block-height/${blockHeight}?format=json&limit=500`);
+
+      const addresses: BlockchainAddress[] = [];
+
+      if (response.data.blocks && response.data.blocks[0]) {
+        const block = response.data.blocks[0];
+
+        for (const tx of block.tx || []) {
+          for (const out of tx.out || []) {
+            if (out.addr) {
+              addresses.push({
+                address: out.addr,
+                balance: out.value / 1e8,
+                totalReceived: 0,
+                totalSent: 0,
+                txCount: 0,
+                firstSeen: new Date(block.time * 1000),
+                lastActivity: new Date(block.time * 1000),
+                transactions: [],
               });
             }
           }
         }
       }
 
-      this.signatureCache.set(address, signatures);
-      this.emit('signatures-extracted', { address, count: signatures.length });
-      return signatures;
+      return addresses;
     } catch (error) {
-      this.emit('error', new Error(`Signature extraction failed for ${address}: ${error instanceof Error ? error.message : 'Unknown error'}`));
+      console.error(`[!] Error extracting addresses from block ${blockHeight}:`, error);
       return [];
     }
   }
 
   /**
-   * Parse DER-encoded ECDSA signature
-   * Extracts r, s values and recovery ID
+   * Parse transactions from blockchain API response
    * @private
    */
-  private parseSignature(signatureHex: string): Partial<ECDSASignature> | null {
-    try {
-      // Remove recovery ID if present (last byte)
-      let sigData = signatureHex;
-      let recoveryId: number | undefined;
-
-      if (signatureHex.length > 128) {
-        recoveryId = parseInt(signatureHex.slice(-2), 16) & 0x03;
-        sigData = signatureHex.slice(0, -2);
-      }
-
-      // Parse DER encoding
-      // DER format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S]
-      if (sigData.startsWith('30')) {
-        const buffer = Buffer.from(sigData, 'hex');
-        
-        // Extract R
-        const rLength = buffer[3];
-        const r = buffer.slice(4, 4 + rLength).toString('hex');
-
-        // Extract S
-        const sStart = 4 + rLength + 2; // +2 for 0x02 and length
-        const sLength = buffer[sStart - 1];
-        const s = buffer.slice(sStart, sStart + sLength).toString('hex');
-
-        // Calculate nonce hash (simplified)
-        const nonce = Buffer.from(r, 'hex').toString('base64');
-
-        return { r, s, recoveryId, nonce };
-      }
-
-      // Raw format (r || s)
-      if (sigData.length === 128) {
-        const r = sigData.slice(0, 64);
-        const s = sigData.slice(64);
-        return { r, s, recoveryId };
-      }
-    } catch (error) {
-      console.error('Signature parsing error:', error);
-    }
-
-    return null;
-  }
-
-  /**
-   * Parse a blockchain transaction
-   * @private
-   */
-  private parseTransaction(txData: any): Transaction {
-    return {
-      txHash: txData.hash,
-      inputs: txData.inputs.map((input: any) => ({
-        previousOutput: `${input.previous_output.hash}:${input.previous_output.index}`,
-        scriptSig: input.script,
-        signature: this.extractSignatureFromScript(input.script),
-        publicKey: this.extractPublicKeyFromScript(input.script),
+  private async parseTransactions(txs: any[], address: string): Promise<Transaction[]> {
+    return txs.map((tx) => ({
+      txid: tx.hash,
+      blockHeight: tx.block_height || 0,
+      timestamp: new Date(tx.time * 1000),
+      inputs: (tx.inputs || []).map((input: any) => ({
+        txid: input.previous_output?.hash || '',
+        vout: input.previous_output?.index || 0,
+        scriptSig: input.script || '',
+        address: input.previous_output?.addresses?.[0] || address,
+        value: input.previous_output?.value || 0,
       })),
-      outputs: txData.out.map((output: any) => ({
-        value: output.value.toString(),
-        scriptPubKey: output.script,
-        address: output.addr,
+      outputs: (tx.out || []).map((output: any) => ({
+        value: output.value / 1e8,
+        scriptPubKey: output.script || '',
+        address: output.addr || '',
       })),
-      timestamp: txData.time || Date.now() / 1000,
-    };
+      rawHex: tx.hash || '',
+    }));
   }
 
   /**
-   * Extract signature from transaction script
+   * Get collected signatures
+   */
+  public getCollectedSignatures(): ECDSASignature[] {
+    return this.collectedSignatures;
+  }
+
+  /**
+   * Clear signature cache
+   */
+  public clearSignatureCache(): void {
+    this.collectedSignatures = [];
+  }
+
+  /**
+   * Utility sleep function
    * @private
    */
-  private extractSignatureFromScript(script: string): string | undefined {
-    // Bitcoin script format: <signature> <pubkey>
-    // Signatures are typically 70-72 bytes in DER format
-    const match = script.match(/^[0-9a-f]{2}([0-9a-f]{140,144})/i);
-    return match ? match[1] : undefined;
-  }
-
-  /**
-   * Extract public key from transaction script
-   * @private
-   */
-  private extractPublicKeyFromScript(script: string): string | undefined {
-    // Typical script ends with public key (33 or 65 bytes)
-    const match = script.match(/([0-9a-f]{66}|[0-9a-f]{130})$/i);
-    return match ? match[1] : undefined;
-  }
-
-  /**
-   * Discover high-value addresses with specific criteria
-   * @private
-   */
-  private async discoverHighValueAddresses(): Promise<BlockchainAddress[]> {
-    await this.respectRateLimit();
-
-    try {
-      const response = await axios.get(`${this.blockchairApi}/addresses?sort=-balance&limit=100`);
-      return response.data.data.slice(0, 50).map((addr: any) => ({
-        address: addr.address,
-        txCount: addr.transaction_count,
-        totalReceived: addr.received.toString(),
-        balance: addr.balance.toString(),
-        firstSeen: addr.first_seen_receiving || 'unknown',
-        lastActivity: addr.last_seen_receiving || 'unknown',
-      }));
-    } catch (error) {
-      console.error('Failed to discover high-value addresses:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Respect API rate limits
-   * @private
-   */
-  private async respectRateLimit(): Promise<void> {
-    const elapsed = Date.now() - this.lastRequestTime;
-    if (elapsed < this.requestDelay) {
-      await new Promise(resolve => setTimeout(resolve, this.requestDelay - elapsed));
-    }
-    this.lastRequestTime = Date.now();
-  }
-
-  /**
-   * Clear caches
-   */
-  public clearCaches(): void {
-    this.addressCache.clear();
-    this.signatureCache.clear();
-  }
-
-  /**
-   * Get cache statistics
-   */
-  public getCacheStats(): { addresses: number; signatures: number } {
-    return {
-      addresses: this.addressCache.size,
-      signatures: Array.from(this.signatureCache.values()).reduce((sum, sigs) => sum + sigs.length, 0),
-    };
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
 
